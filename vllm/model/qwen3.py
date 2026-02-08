@@ -52,9 +52,9 @@ def _maybe_scale_positions(positions: jax.Array,
 def apply_rope(x: jax.Array, positions: jax.Array, head_dim: int,
                rope_theta: float, rope_scaling: Optional[dict]) -> jax.Array:
     positions = _maybe_scale_positions(positions, rope_scaling)
-    positions = positions.astype(jnp.float32)
+    positions = positions.astype(jnp.bfloat16)
     inv_freq = 1.0 / (rope_theta**(jnp.arange(0, head_dim, 2,
-                                             dtype=jnp.float32) / head_dim))
+                                             dtype=jnp.bfloat16) / head_dim))
     freqs = jnp.einsum("t,d->td", positions, inv_freq)
     cos = jnp.cos(freqs)[:, None, :]
     sin = jnp.sin(freqs)[:, None, :]
@@ -72,10 +72,11 @@ def apply_rope(x: jax.Array, positions: jax.Array, head_dim: int,
 
 
 def _repeat_kv(x: jax.Array, num_heads: int) -> jax.Array:
-    if x.shape[1] == num_heads:
+    if x.shape[-2] == num_heads:
         return x
-    repeat = num_heads // x.shape[1]
-    return jnp.repeat(x, repeat, axis=1)
+    repeat = num_heads // x.shape[-2]
+    axis = -2
+    return jnp.repeat(x, repeat, axis=axis)
 
 
 def _scaled_dot_product_attention(q: jax.Array,
@@ -98,22 +99,15 @@ def _update_kv_cache(kv_cache: jax.Array, slot_mapping: jax.Array,
                      k: jax.Array, v: jax.Array) -> jax.Array:
     flat_cache = kv_cache.reshape(kv_cache.shape[0], -1, kv_cache.shape[-2],
                                   kv_cache.shape[-1])
-    flat_cache = flat_cache.at[0, slot_mapping].set(k)
-    flat_cache = flat_cache.at[1, slot_mapping].set(v)
+    flat_cache = flat_cache.at[0, slot_mapping].set(k, mode="drop")
+    flat_cache = flat_cache.at[1, slot_mapping].set(v, mode="drop")
     return flat_cache.reshape(kv_cache.shape)
 
 
-def _build_slot_indices(block_table: jax.Array, context_len: int,
-                        block_size: int) -> jax.Array:
-    num_blocks = (context_len + block_size - 1) // block_size
-    slots = []
-    for block_id in block_table[:num_blocks]:
-        block_id = int(block_id)
-        slots.append(
-            jnp.arange(block_size, dtype=jnp.int32) + block_id * block_size)
-    if not slots:
-        return jnp.empty((0, ), dtype=jnp.int32)
-    return jnp.concatenate(slots, axis=0)[:context_len]
+def _build_slots(block_tables: jax.Array, block_size: int) -> jax.Array:
+    offsets = jnp.arange(block_size, dtype=jnp.int32)
+    slots = block_tables[..., None] * block_size + offsets
+    return slots.reshape(block_tables.shape[0], -1)
 
 
 def _decode_attention(q: jax.Array, kv_cache: jax.Array,
@@ -124,19 +118,23 @@ def _decode_attention(q: jax.Array, kv_cache: jax.Array,
     block_size = kv_cache.shape[2]
     flat_cache = kv_cache.reshape(2, -1, num_kv_heads, head_dim)
 
-    outputs = []
-    for i in range(q.shape[0]):
-        context_len = int(metadata.context_lens[i])
-        block_table = metadata.block_tables[i]
-        slots = _build_slot_indices(block_table, context_len, block_size)
-        k = flat_cache[0, slots]
-        v = flat_cache[1, slots]
-        k = _repeat_kv(k, num_heads)
-        v = _repeat_kv(v, num_heads)
-        outputs.append(_scaled_dot_product_attention(q[i:i + 1], k, v, False))
-    if not outputs:
-        return jnp.empty((0, num_heads, head_dim), dtype=q.dtype)
-    return jnp.concatenate(outputs, axis=0)
+    slots = _build_slots(metadata.block_tables, block_size)
+    slots_clipped = jnp.where(slots >= 0, slots, 0)
+    token_idx = jnp.arange(slots.shape[1], dtype=jnp.int32)
+    valid = (slots >= 0) & (token_idx[None, :] < metadata.context_lens[:, None])
+
+    k = flat_cache[0, slots_clipped]
+    v = flat_cache[1, slots_clipped]
+    k = _repeat_kv(k, num_heads)
+    v = _repeat_kv(v, num_heads)
+
+    scores = jnp.einsum("bnh,bsnh->bns", q, k) / jnp.sqrt(head_dim)
+    scores = jnp.where(valid[:, None, :], scores, jnp.finfo(scores.dtype).min)
+    weights = jax.nn.softmax(scores, axis=-1)
+    query_valid = metadata.context_lens > 0
+    weights = jnp.where(query_valid[:, None, None], weights, 0)
+    out = jnp.einsum("bns,bsnh->bnh", weights, v)
+    return out
 
 
 def _prefill_attention(q: jax.Array, k: jax.Array, v: jax.Array,
@@ -144,20 +142,24 @@ def _prefill_attention(q: jax.Array, k: jax.Array, v: jax.Array,
     num_heads = q.shape[1]
     k = _repeat_kv(k, num_heads)
     v = _repeat_kv(v, num_heads)
-    cu_seqlens = metadata.cu_seqlens_q
 
-    outputs = []
-    start = 0
-    for idx in range(cu_seqlens.shape[0] - 1):
-        end = int(cu_seqlens[idx + 1])
-        seq_q = q[start:end]
-        seq_k = k[start:end]
-        seq_v = v[start:end]
-        outputs.append(_scaled_dot_product_attention(seq_q, seq_k, seq_v, True))
-        start = end
-    if not outputs:
-        return jnp.empty((0, num_heads, q.shape[-1]), dtype=q.dtype)
-    return jnp.concatenate(outputs, axis=0)
+    token_idx = jnp.arange(q.shape[0], dtype=jnp.int32)
+    seq_ids = jnp.sum(token_idx[:, None] >= metadata.cu_seqlens_q[None, 1:],
+                      axis=1)
+    token_valid = metadata.slot_mapping >= 0
+    causal = metadata.input_positions[:, None] >= metadata.input_positions[None, :]
+    same_seq = seq_ids[:, None] == seq_ids[None, :]
+    mask = same_seq & causal & token_valid[:, None] & token_valid[None, :]
+
+    q_t = jnp.transpose(q, (1, 0, 2))
+    k_t = jnp.transpose(k, (1, 0, 2))
+    scores = jnp.einsum("hqd,hkd->hqk", q_t, k_t) / jnp.sqrt(q.shape[-1])
+    scores = jnp.where(mask[None, :, :], scores, jnp.finfo(scores.dtype).min)
+    weights = jax.nn.softmax(scores, axis=-1)
+    weights = jnp.where(token_valid[None, :, None], weights, 0)
+    v_t = jnp.transpose(v, (1, 0, 2))
+    out = jnp.einsum("hqk,hkd->hqd", weights, v_t)
+    return jnp.transpose(out, (1, 0, 2))
 
 
 def attention(kv_cache: jax.Array, q: jax.Array, k: jax.Array, v: jax.Array,
@@ -346,7 +348,7 @@ class Qwen3Model(nnx.Module):
     def __init__(self, config: Qwen3Config, rng: nnx.Rngs, mesh=None,
                  dtype: Optional[jnp.dtype] = None,
                  vocab_size: Optional[int] = None) -> None:
-        dtype = dtype or jnp.float32
+        dtype = dtype or jnp.bfloat16
         vocab_size = vocab_size or config.vocab_size
         rms_norm_eps = config.rms_norm_eps
         hidden_size = config.hidden_size

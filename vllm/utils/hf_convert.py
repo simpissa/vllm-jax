@@ -28,7 +28,7 @@ def _flat_key_from_str(path: str) -> FlatKey:
 
 
 def _convert_weight(key: str, value, config: Qwen3Config) -> jax.Array:
-    value = jnp.asarray(value)
+    value = jnp.asarray(value, dtype=jnp.bfloat16)
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
     head_dim = getattr(config, "head_dim",
