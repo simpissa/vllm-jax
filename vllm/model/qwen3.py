@@ -5,7 +5,9 @@ import jax.numpy as jnp
 from flax import nnx, struct
 from transformers import Qwen3Config, modeling_flax_utils
 
+from vllm.layers.paged_attention import paged_attention
 init_fn = nnx.initializers.uniform()
+USE_PAGED_ATTENTION = True
 
 
 @struct.dataclass
@@ -168,7 +170,29 @@ def attention(kv_cache: jax.Array, q: jax.Array, k: jax.Array, v: jax.Array,
     if isinstance(metadata, PrefillAttentionMetadata):
         outputs = _prefill_attention(q, k, v, metadata)
     else:
-        outputs = _decode_attention(q, kv_cache, metadata)
+        if USE_PAGED_ATTENTION:
+            k_pages = jnp.transpose(kv_cache[0], (2, 0, 1, 3))
+            v_pages = jnp.transpose(kv_cache[1], (2, 0, 1, 3))
+            safe_block_tables = jnp.where(metadata.block_tables >= 0,
+                                          metadata.block_tables, 0).astype(jnp.int32)
+            lengths = metadata.context_lens.astype(jnp.int32)
+            pages_per_sequence = metadata.block_tables.shape[1]
+            k_splits = 1
+            for candidate in (16, 8, 4, 2):
+                if pages_per_sequence % candidate == 0:
+                    k_splits = candidate
+                    break
+            q_scaled = q / jnp.sqrt(jnp.asarray(q.shape[-1], dtype=q.dtype))
+            outputs = paged_attention(
+                q_scaled,
+                k_pages,
+                v_pages,
+                safe_block_tables,
+                lengths,
+                k_splits=k_splits,
+            )
+        else:
+            outputs = _decode_attention(q, kv_cache, metadata)
     return kv_cache, outputs
 
 
