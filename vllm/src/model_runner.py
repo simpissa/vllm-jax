@@ -35,6 +35,7 @@ class PrefillBatch:
     cu_seqlens_k: jnp.ndarray
     max_seqlen_q: jnp.ndarray
     max_seqlen_k: jnp.ndarray
+    max_seqlen_bucket: int = struct.field(pytree_node=False)
 
 
 @nnx.jit
@@ -48,6 +49,7 @@ def prefill_step(model: Qwen3ForCausalLM, kv_caches: list[jax.Array],
         cu_seqlens_k=batch.cu_seqlens_k,
         max_seqlen_q=batch.max_seqlen_q,
         max_seqlen_k=batch.max_seqlen_k,
+        max_seqlen_bucket=batch.max_seqlen_bucket,
     )
     kv_caches, _, _ = model(
         kv_caches,
@@ -147,6 +149,7 @@ class ModelRunner:
                 cu_seqlens_k=self._to_device(jnp.asarray(cu_seqlens, dtype=jnp.int32)),
                 max_seqlen_q=self._to_device(jnp.asarray(token_bucket, dtype=jnp.int32)),
                 max_seqlen_k=self._to_device(jnp.asarray(token_bucket, dtype=jnp.int32)),
+                max_seqlen_bucket=token_bucket,
             )
             self.forward_prefill(prefill_batch)
 
@@ -248,6 +251,7 @@ class ModelRunner:
             cu_seqlens.append(cu_seqlens[-1])
 
         max_seqlen = max(seqlens)
+        max_seqlen_bucket = self._bucket_size(max_seqlen)
         block_tables = self.pad_block_tables(block_tables, bucket_batch)
         return PrefillBatch(
             input_ids=self._to_device(jnp.asarray(input_ids, dtype=jnp.int32)),
@@ -258,6 +262,7 @@ class ModelRunner:
             cu_seqlens_k=self._to_device(jnp.asarray(cu_seqlens, dtype=jnp.int32)),
             max_seqlen_q=self._to_device(jnp.asarray(max_seqlen, dtype=jnp.int32)),
             max_seqlen_k=self._to_device(jnp.asarray(max_seqlen, dtype=jnp.int32)),
+            max_seqlen_bucket=max_seqlen_bucket,
         )
 
     def prepare_decode(self, requests: list[Request]) -> DecodeBatch:

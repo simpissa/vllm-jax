@@ -5,9 +5,13 @@ import jax.numpy as jnp
 from flax import nnx, struct
 from transformers import Qwen3Config, modeling_flax_utils
 
-from vllm.layers.paged_attention import paged_attention
+from vllm.kernels.decode_paged_attention import decode_paged_attention
+from vllm.kernels.prefill_paged_attention import (
+    prefill_paged_attention,
+)
 init_fn = nnx.initializers.uniform()
-USE_PAGED_ATTENTION = True
+USE_DECODE_PAGED_ATTENTION_KERNEL = True
+USE_PREFILL_PAGED_ATTENTION_KERNEL = True
 
 
 @struct.dataclass
@@ -27,6 +31,7 @@ class PrefillAttentionMetadata:
     cu_seqlens_k: jax.Array
     max_seqlen_q: jax.Array
     max_seqlen_k: jax.Array
+    max_seqlen_bucket: int = struct.field(pytree_node=False)
 
 
 AttentionMetadata = Union[DecodeAttentionMetadata, PrefillAttentionMetadata]
@@ -168,9 +173,26 @@ def attention(kv_cache: jax.Array, q: jax.Array, k: jax.Array, v: jax.Array,
               metadata: AttentionMetadata) -> Tuple[jax.Array, jax.Array]:
     kv_cache = _update_kv_cache(kv_cache, metadata.slot_mapping, k, v)
     if isinstance(metadata, PrefillAttentionMetadata):
-        outputs = _prefill_attention(q, k, v, metadata)
+        if USE_PREFILL_PAGED_ATTENTION_KERNEL:
+            k_pages = jnp.transpose(kv_cache[0], (2, 0, 1, 3))
+            v_pages = jnp.transpose(kv_cache[1], (2, 0, 1, 3))
+            safe_block_tables = jnp.where(metadata.block_tables >= 0,
+                                          metadata.block_tables, 0).astype(jnp.int32)
+            cu_seqlens = metadata.cu_seqlens_q.astype(jnp.int32)
+            outputs = prefill_paged_attention(
+                q,
+                k_pages,
+                v_pages,
+                safe_block_tables,
+                cu_seqlens,
+                metadata.slot_mapping,
+                metadata.input_positions,
+                max_seqlen_bucket=metadata.max_seqlen_bucket,
+            )
+        else:
+            outputs = _prefill_attention(q, k, v, metadata)
     else:
-        if USE_PAGED_ATTENTION:
+        if USE_DECODE_PAGED_ATTENTION_KERNEL:
             k_pages = jnp.transpose(kv_cache[0], (2, 0, 1, 3))
             v_pages = jnp.transpose(kv_cache[1], (2, 0, 1, 3))
             safe_block_tables = jnp.where(metadata.block_tables >= 0,
@@ -183,7 +205,7 @@ def attention(kv_cache: jax.Array, q: jax.Array, k: jax.Array, v: jax.Array,
                     k_splits = candidate
                     break
             q_scaled = q / jnp.sqrt(jnp.asarray(q.shape[-1], dtype=q.dtype))
-            outputs = paged_attention(
+            outputs = decode_paged_attention(
                 q_scaled,
                 k_pages,
                 v_pages,
