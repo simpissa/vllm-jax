@@ -38,47 +38,6 @@ class PrefillBatch:
     max_seqlen_bucket: int = struct.field(pytree_node=False)
 
 
-@jax.jit
-def prefill_step(model_state: tuple[Any, Any], kv_caches: list[jax.Array],
-                 batch: PrefillBatch) -> tuple[tuple[Any, Any], list[jax.Array]]:
-    metadata = PrefillAttentionMetadata(
-        input_positions=batch.positions,
-        slot_mapping=batch.slot_mapping,
-        block_tables=batch.block_tables,
-        cu_seqlens_q=batch.cu_seqlens_q,
-        cu_seqlens_k=batch.cu_seqlens_k,
-        max_seqlen_q=batch.max_seqlen_q,
-        max_seqlen_k=batch.max_seqlen_k,
-        max_seqlen_bucket=batch.max_seqlen_bucket,
-    )
-    (kv_caches, _, _), model_state = nnx.call(model_state)(
-        kv_caches,
-        batch.input_ids,
-        metadata,
-    )
-    return model_state, kv_caches
-
-
-@jax.jit
-def decode_step(
-    model_state: tuple[Any, Any],
-    kv_caches: list[jax.Array],
-    batch: DecodeBatch,
-) -> tuple[tuple[Any, Any], list[jax.Array], jax.Array]:
-    metadata = DecodeAttentionMetadata(
-        input_positions=batch.positions,
-        slot_mapping=batch.slot_mapping,
-        block_tables=batch.block_tables,
-        context_lens=batch.context_lens,
-    )
-    (kv_caches, hidden_states, _), model_state = nnx.call(model_state)(
-        kv_caches,
-        batch.input_ids,
-        metadata,
-    )
-    logits, model_state = nnx.call(model_state).compute_logits(hidden_states)
-    return model_state, kv_caches, logits
-
 class ModelRunner:
 
     def __init__(self, config: Config, kv_cache_manager: KVCacheManager, device: Any):
@@ -117,7 +76,58 @@ class ModelRunner:
             )
             nnx.update(self.model, moved_state)
         set_mesh(self.mesh)
-        self.model_state = nnx.split(self.model)
+        self.model_graphdef, self.model_vars = nnx.split(self.model)
+
+        model_graphdef = self.model_graphdef
+
+        @jax.jit
+        def prefill_step_fn(
+            model_vars: Any,
+            kv_caches: list[jax.Array],
+            batch: PrefillBatch,
+        ) -> tuple[Any, list[jax.Array]]:
+            metadata = PrefillAttentionMetadata(
+                input_positions=batch.positions,
+                slot_mapping=batch.slot_mapping,
+                block_tables=batch.block_tables,
+                cu_seqlens_q=batch.cu_seqlens_q,
+                cu_seqlens_k=batch.cu_seqlens_k,
+                max_seqlen_q=batch.max_seqlen_q,
+                max_seqlen_k=batch.max_seqlen_k,
+                max_seqlen_bucket=batch.max_seqlen_bucket,
+            )
+            (kv_caches, _, _), (_, model_vars) = nnx.call(
+                (model_graphdef, model_vars)
+            )(
+                kv_caches,
+                batch.input_ids,
+                metadata,
+            )
+            return model_vars, kv_caches
+
+        @jax.jit
+        def decode_step_fn(
+            model_vars: Any,
+            kv_caches: list[jax.Array],
+            batch: DecodeBatch,
+        ) -> tuple[Any, list[jax.Array], jax.Array]:
+            metadata = DecodeAttentionMetadata(
+                input_positions=batch.positions,
+                slot_mapping=batch.slot_mapping,
+                block_tables=batch.block_tables,
+                context_lens=batch.context_lens,
+            )
+            (kv_caches, logits), (_, model_vars) = nnx.call(
+                (model_graphdef, model_vars)
+            ).forward_with_logits(
+                kv_caches,
+                batch.input_ids,
+                metadata,
+            )
+            return model_vars, kv_caches, logits
+
+        self.prefill_step_fn = prefill_step_fn
+        self.decode_step_fn = decode_step_fn
         
         print(f"Loaded HF weights for {config.model}")
         self.kv_caches = self._init_kv_cache(config.num_blocks)
@@ -305,16 +315,16 @@ class ModelRunner:
         )
 
     def forward_decode(self, batch: DecodeBatch) -> jax.Array:
-        self.model_state, self.kv_caches, logits = decode_step(
-            self.model_state,
+        self.model_vars, self.kv_caches, logits = self.decode_step_fn(
+            self.model_vars,
             self.kv_caches,
             batch,
         )
         return logits
 
     def forward_prefill(self, batch: PrefillBatch):
-        self.model_state, self.kv_caches = prefill_step(
-            self.model_state,
+        self.model_vars, self.kv_caches = self.prefill_step_fn(
+            self.model_vars,
             self.kv_caches,
             batch,
         )

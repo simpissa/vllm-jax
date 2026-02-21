@@ -471,6 +471,16 @@ class Qwen3ForCausalLM(nnx.Module):
         )
         return kv_caches, x, []
 
+    def forward_with_logits(self, kv_caches: List[jax.Array], input_ids: jax.Array,
+                            attention_metadata: AttentionMetadata
+                            ) -> Tuple[List[jax.Array], jax.Array]:
+        kv_caches, hidden_states, _ = self(
+            kv_caches,
+            input_ids,
+            attention_metadata,
+        )
+        return kv_caches, self.compute_logits(hidden_states)
+
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if self.config.tie_word_embeddings:
             return jnp.dot(hidden_states, self.model.lm_head.value.T)

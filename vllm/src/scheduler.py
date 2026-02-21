@@ -10,8 +10,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_num_seqs = config.max_num_seqs
         self.kv_cache_manager = kv_cache_manager
-        self.waiting : list[Request] = deque()
-        self.running : list[Request] = deque() # front is left
+        self.waiting: deque[Request] = deque()
+        self.running: deque[Request] = deque() # front is left
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -68,3 +68,4 @@ class Scheduler:
                     or request.num_completion_tokens == request.max_new_tokens:
                 request.status = Status.FINISHED
                 self.running.remove(request)
+                self.kv_cache_manager.deallocate(request)
