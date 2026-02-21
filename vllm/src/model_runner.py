@@ -38,9 +38,9 @@ class PrefillBatch:
     max_seqlen_bucket: int = struct.field(pytree_node=False)
 
 
-@nnx.jit
-def prefill_step(model: Qwen3ForCausalLM, kv_caches: list[jax.Array],
-                 batch: PrefillBatch) -> list[jax.Array]:
+@jax.jit
+def prefill_step(model_state: tuple[Any, Any], kv_caches: list[jax.Array],
+                 batch: PrefillBatch) -> tuple[tuple[Any, Any], list[jax.Array]]:
     metadata = PrefillAttentionMetadata(
         input_positions=batch.positions,
         slot_mapping=batch.slot_mapping,
@@ -51,30 +51,33 @@ def prefill_step(model: Qwen3ForCausalLM, kv_caches: list[jax.Array],
         max_seqlen_k=batch.max_seqlen_k,
         max_seqlen_bucket=batch.max_seqlen_bucket,
     )
-    kv_caches, _, _ = model(
+    (kv_caches, _, _), model_state = nnx.call(model_state)(
         kv_caches,
         batch.input_ids,
         metadata,
     )
-    return kv_caches
+    return model_state, kv_caches
 
 
-@nnx.jit
-def decode_step(model: Qwen3ForCausalLM, kv_caches: list[jax.Array],
-                batch: DecodeBatch) -> tuple[list[jax.Array], jax.Array]:
+@jax.jit
+def decode_step(
+    model_state: tuple[Any, Any],
+    kv_caches: list[jax.Array],
+    batch: DecodeBatch,
+) -> tuple[tuple[Any, Any], list[jax.Array], jax.Array]:
     metadata = DecodeAttentionMetadata(
         input_positions=batch.positions,
         slot_mapping=batch.slot_mapping,
         block_tables=batch.block_tables,
         context_lens=batch.context_lens,
     )
-    kv_caches, hidden_states, _ = model(
+    (kv_caches, hidden_states, _), model_state = nnx.call(model_state)(
         kv_caches,
         batch.input_ids,
         metadata,
     )
-    logits = model.compute_logits(hidden_states)
-    return kv_caches, logits
+    logits, model_state = nnx.call(model_state).compute_logits(hidden_states)
+    return model_state, kv_caches, logits
 
 class ModelRunner:
 
@@ -114,6 +117,7 @@ class ModelRunner:
             )
             nnx.update(self.model, moved_state)
         set_mesh(self.mesh)
+        self.model_state = nnx.split(self.model)
         
         print(f"Loaded HF weights for {config.model}")
         self.kv_caches = self._init_kv_cache(config.num_blocks)
@@ -301,11 +305,19 @@ class ModelRunner:
         )
 
     def forward_decode(self, batch: DecodeBatch) -> jax.Array:
-        self.kv_caches, logits = decode_step(self.model, self.kv_caches, batch)
+        self.model_state, self.kv_caches, logits = decode_step(
+            self.model_state,
+            self.kv_caches,
+            batch,
+        )
         return logits
 
     def forward_prefill(self, batch: PrefillBatch):
-        self.kv_caches = prefill_step(self.model, self.kv_caches, batch)
+        self.model_state, self.kv_caches = prefill_step(
+            self.model_state,
+            self.kv_caches,
+            batch,
+        )
 
     def run(self,
             decode_requests: list[Request],
@@ -315,16 +327,30 @@ class ModelRunner:
         if decode_requests:
             decode_batch = self.prepare_decode(decode_requests)
             logits = self.forward_decode(decode_batch)
-            for request, request_logits in zip(decode_requests, logits):
+            sampling_params = decode_requests[0].sampling_params
+            if all(request.sampling_params == sampling_params for request in decode_requests):
                 token_ids, rng_key = self.sampler.sample(
-                    request_logits,
-                    request.sampling_params,
+                    logits[:len(decode_requests)],
+                    sampling_params,
                     rng_key,
                 )
-                token_id = int(jax.device_get(token_ids)[0])
-                request.token_ids.append(token_id)
-                request.num_completion_tokens += 1
-                decode_outputs.append(token_id)
+                sampled_token_ids = jax.device_get(token_ids)
+                for request, token_id in zip(decode_requests, sampled_token_ids):
+                    token_id = int(token_id)
+                    request.token_ids.append(token_id)
+                    request.num_completion_tokens += 1
+                    decode_outputs.append(token_id)
+            else:
+                for request, request_logits in zip(decode_requests, logits):
+                    token_ids, rng_key = self.sampler.sample(
+                        request_logits,
+                        request.sampling_params,
+                        rng_key,
+                    )
+                    token_id = int(jax.device_get(token_ids)[0])
+                    request.token_ids.append(token_id)
+                    request.num_completion_tokens += 1
+                    decode_outputs.append(token_id)
 
         if prefill_requests:
             prefill_batch = self.prepare_prefill(prefill_requests)
